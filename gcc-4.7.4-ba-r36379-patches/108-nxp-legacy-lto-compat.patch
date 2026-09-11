@@ -1,0 +1,407 @@
+--- gcc/data-streamer.h
++++ gcc/data-streamer.h
+@@ -28,9 +28,12 @@
+ /* Data structures used to pack values and bitflags into a vector of
+    words.  Used to stream values of a fixed number of bits in a space
+    efficient way.  */
+-static unsigned const BITS_PER_BITPACK_WORD = HOST_BITS_PER_WIDE_INT;
++/* The original NXP BA2 compiler used 32-bit bitpack words.  GCC 4.7
++   exposed that host width in LTO 2.1.  Preserve the legacy stream layout
++   without changing the current compiler's host or target ABI.  */
++static unsigned const BITS_PER_BITPACK_WORD = 32;
+ 
+-typedef unsigned HOST_WIDE_INT bitpack_word_t;
++typedef uint32_t bitpack_word_t;
+ DEF_VEC_I(bitpack_word_t);
+ DEF_VEC_ALLOC_I(bitpack_word_t, heap);
+ 
+@@ -75,6 +78,7 @@
+ void streamer_write_uhwi_stream (struct lto_output_stream *,
+ 				 unsigned HOST_WIDE_INT);
+ void streamer_write_hwi_stream (struct lto_output_stream *, HOST_WIDE_INT);
++void streamer_write_hwi32_stream (struct lto_output_stream *, HOST_WIDE_INT);
+ 
+ /* In data-streamer-in.c  */
+ const char *string_for_index (struct data_in *, unsigned int, unsigned int *);
+@@ -84,6 +88,8 @@
+ 					  unsigned int *);
+ unsigned HOST_WIDE_INT streamer_read_uhwi (struct lto_input_block *);
+ HOST_WIDE_INT streamer_read_hwi (struct lto_input_block *);
++uint32_t streamer_read_uhwi32 (struct lto_input_block *);
++HOST_WIDE_INT streamer_read_hwi32 (struct lto_input_block *);
+ 
+ /* Returns a hash code for P.  Adapted from libiberty's htab_hash_string
+    to support strings that may not end in '\0'.  */
+@@ -169,7 +175,7 @@
+ streamer_read_bitpack (struct lto_input_block *ib)
+ {
+   struct bitpack_d bp;
+-  bp.word = streamer_read_uhwi (ib);
++  bp.word = streamer_read_uhwi32 (ib);
+   bp.pos = 0;
+   bp.stream = (void *)ib;
+   return bp;
+@@ -191,7 +197,7 @@
+   if (pos + nbits > BITS_PER_BITPACK_WORD)
+     {
+       bp->word = val 
+-	= streamer_read_uhwi ((struct lto_input_block *)bp->stream);
++	= streamer_read_uhwi32 ((struct lto_input_block *)bp->stream);
+       bp->pos = nbits;
+       return val & mask;
+     }
+--- gcc/data-streamer-in.c
++++ gcc/data-streamer-in.c
+@@ -106,6 +106,43 @@
+ }
+ 
+ 
++/* Read a legacy 32-bit unsigned word encoded as ULEB128.  Reject values
++   wider than 32 bits or encodings longer than five bytes before an invalid
++   shift or narrowing.  This is not a general LTO format detector.  */
++
++uint32_t
++streamer_read_uhwi32 (struct lto_input_block *ib)
++{
++  uint32_t result = 0;
++  unsigned shift;
++
++  for (shift = 0; shift <= 28; shift += 7)
++    {
++      unsigned byte = streamer_read_uchar (ib);
++      if (shift == 28 && (byte & 0xf0))
++        fatal_error ("invalid 32-bit NXP LTO word; rebuild objects with "
++                     "the NXP-compatible toolchain");
++      result |= (uint32_t) (byte & 0x7f) << shift;
++      if (!(byte & 0x80))
++        return result;
++    }
++  gcc_unreachable ();
++}
++
++/* Some legacy fields are signed, but were written with the unsigned
++   encoder.  Extend their 32-bit two's-complement representation explicitly,
++   rather than interpreting 0xfffffffc as +4294967292 on LP64.  */
++
++HOST_WIDE_INT
++streamer_read_hwi32 (struct lto_input_block *ib)
++{
++  uint32_t word = streamer_read_uhwi32 (ib);
++  if (word & 0x80000000U)
++    return -1 - (HOST_WIDE_INT) (0xffffffffU - word);
++  return word;
++}
++
++
+ /* Read a HOST_WIDE_INT number from IB.  */
+ 
+ HOST_WIDE_INT
+--- gcc/data-streamer-out.c
++++ gcc/data-streamer-out.c
+@@ -23,8 +23,21 @@
+ #include "config.h"
+ #include "system.h"
+ #include "coretypes.h"
++#include "diagnostic.h"
+ #include "data-streamer.h"
+ 
++/* Preserve signed fields which NXP encoded as unsigned 32-bit words.
++   Do not change these to SLEB128: that would change the legacy format.  */
++
++void
++streamer_write_hwi32_stream (struct lto_output_stream *stream,
++                             HOST_WIDE_INT value)
++{
++  if (value < (-2147483647 - 1) || value > 2147483647)
++    fatal_error ("signed value does not fit the NXP LTO 32-bit format");
++  streamer_write_uhwi_stream (stream, (uint32_t) value);
++}
++
+ /* Return index used to reference STRING of LEN characters in the string table
+    in OB.  The string might or might not include a trailing '\0'.
+    Then put the index onto the INDEX_STREAM.  
+--- gcc/tree-streamer.h
++++ gcc/tree-streamer.h
+@@ -26,6 +26,15 @@
+ #include "streamer-hooks.h"
+ #include "lto-streamer.h"
+ 
++/* Match double_int_to_tree: internal TYPE_IS_SIZETYPE integers use sign
++   extension even when unsigned; other unsigned types use zero extension.  */
++static inline bool
++streamer_sign_extended_type_p (const_tree type)
++{
++  return (!TYPE_UNSIGNED (type)
++          || (TREE_CODE (type) == INTEGER_TYPE && TYPE_IS_SIZETYPE (type)));
++}
++
+ /* Cache of pickled nodes.  Used to avoid writing the same node more
+    than once.  The first time a tree node is streamed out, it is
+    entered in this cache.  Subsequent references to the same node are
+--- gcc/tree-streamer-in.c
++++ gcc/tree-streamer-in.c
+@@ -148,18 +148,40 @@
+ unpack_ts_real_cst_value_fields (struct bitpack_d *bp, tree expr)
+ {
+   unsigned i;
++#if HOST_BITS_PER_LONG == 64
++  unsigned bit;
++  unsigned HOST_WIDE_INT word;
++#endif
+   REAL_VALUE_TYPE r;
+   REAL_VALUE_TYPE *rp;
+ 
++  memset (&r, 0, sizeof (r));
+   r.cl = (unsigned) bp_unpack_value (bp, 2);
+   r.decimal = (unsigned) bp_unpack_value (bp, 1);
+   r.sign = (unsigned) bp_unpack_value (bp, 1);
+   r.signalling = (unsigned) bp_unpack_value (bp, 1);
+   r.canonical = (unsigned) bp_unpack_value (bp, 1);
+   r.uexp = (unsigned) bp_unpack_value (bp, EXP_BITS);
+-  for (i = 0; i < SIGSZ; i++)
+-    r.sig[i] = (unsigned long) bp_unpack_value (bp, HOST_BITS_PER_LONG);
++  if (r.decimal)
++    fatal_error ("decimal floating point is not supported by BA2 LTO");
+ 
++  /* Read the five 32-bit significand words emitted by the original NXP
++     Windows BA2 compiler.  See the matching writer for the bit layout.  */
++#if HOST_BITS_PER_LONG == 32
++  for (i = 0; i < 5; i++)
++    r.sig[i] = (unsigned long) bp_unpack_value (bp, 32);
++#elif HOST_BITS_PER_LONG == 64
++  /* Align the legacy 160-bit significand at the most-significant end of
++     the LP64 192-bit representation, leaving 32 low guard bits clear.  */
++  for (i = 0, bit = 32; i < 5; i++, bit += 32)
++    {
++      word = bp_unpack_value (bp, 32);
++      r.sig[bit / 64] |= (unsigned long) word << (bit % 64);
++    }
++#else
++# error unsupported HOST_BITS_PER_LONG for NXP-compatible BA2 LTO
++#endif
++
+   rp = ggc_alloc_real_value ();
+   memcpy (rp, &r, sizeof (REAL_VALUE_TYPE));
+   TREE_REAL_CST_PTR (expr) = rp;
+@@ -174,8 +196,25 @@
+ {
+   FIXED_VALUE_TYPE *fp = ggc_alloc_fixed_value ();
+   fp->mode = bp_unpack_enum (bp, machine_mode, MAX_MACHINE_MODE);
++#if HOST_BITS_PER_WIDE_INT == 32
+   fp->data.low = bp_unpack_var_len_int (bp);
+   fp->data.high = bp_unpack_var_len_int (bp);
++#elif HOST_BITS_PER_WIDE_INT == 64
++  {
++    HOST_WIDE_INT low32 = bp_unpack_var_len_int (bp);
++    HOST_WIDE_INT high32 = bp_unpack_var_len_int (bp);
++
++    fp->data.low = ((unsigned HOST_WIDE_INT) (uint32_t) low32
++                    | (unsigned HOST_WIDE_INT) (uint32_t) high32 << 32);
++    if (low32 < (-2147483647 - 1) || low32 > 2147483647
++        || high32 < (-2147483647 - 1) || high32 > 2147483647)
++      fatal_error ("invalid NXP LTO fixed-point limbs");
++    fp->data.high = (SIGNED_FIXED_POINT_MODE_P (fp->mode)
++                     && ((uint32_t) high32 & 0x80000000U)) ? -1 : 0;
++  }
++#else
++# error unsupported HOST_BITS_PER_WIDE_INT for NXP-compatible BA2 LTO
++#endif
+   TREE_FIXED_CST_PTR (expr) = fp;
+ }
+ 
+@@ -1013,12 +1052,27 @@
+ {
+   tree result, type;
+   HOST_WIDE_INT low, high;
++#if HOST_BITS_PER_WIDE_INT == 64
++  unsigned HOST_WIDE_INT low32, high32;
++#endif
+   bool overflow_p;
+ 
+   type = stream_read_tree (ib, data_in);
+   overflow_p = (streamer_read_uchar (ib) != 0);
++#if HOST_BITS_PER_WIDE_INT == 32
+   low = streamer_read_uhwi (ib);
+   high = streamer_read_uhwi (ib);
++#elif HOST_BITS_PER_WIDE_INT == 64
++  /* Combine the legacy 32-bit limbs into the native 64-bit low limb.
++     Reconstruct the high limb using the type's sign or zero extension.  */
++  low32 = streamer_read_uhwi32 (ib);
++  high32 = streamer_read_uhwi32 (ib);
++  low = low32 | (high32 << 32);
++  high = (streamer_sign_extended_type_p (type)
++          && (high32 & 0x80000000U)) ? -1 : 0;
++#else
++# error unsupported HOST_BITS_PER_WIDE_INT for NXP-compatible BA2 LTO
++#endif
+   result = build_int_cst_wide (type, low, high);
+ 
+   /* If the original constant had overflown, build a replica of RESULT to
+--- gcc/tree-streamer-out.c
++++ gcc/tree-streamer-out.c
+@@ -119,17 +119,51 @@
+ pack_ts_real_cst_value_fields (struct bitpack_d *bp, tree expr)
+ {
+   unsigned i;
++#if HOST_BITS_PER_LONG == 64
++  unsigned bit;
++  unsigned HOST_WIDE_INT word;
++#endif
+   REAL_VALUE_TYPE r;
+ 
+   r = TREE_REAL_CST (expr);
++  /* BA2 has no decimal floating-point modes.  Reject decimal values;
++     the significand conversion below handles binary values only.  */
++  if (r.decimal)
++    fatal_error ("decimal floating point is not supported by BA2 LTO");
+   bp_pack_value (bp, r.cl, 2);
+   bp_pack_value (bp, r.decimal, 1);
+   bp_pack_value (bp, r.sign, 1);
+   bp_pack_value (bp, r.signalling, 1);
+   bp_pack_value (bp, r.canonical, 1);
+   bp_pack_value (bp, r.uexp, EXP_BITS);
+-  for (i = 0; i < SIGSZ; i++)
+-    bp_pack_value (bp, r.sig[i], HOST_BITS_PER_LONG);
++
++  /* The original NXP Windows BA2 compiler serialized REAL_CST significands
++     as five 32-bit words (160 bits).  GCC 4.7 derives this layout from
++     HOST_BITS_PER_LONG; an unpatched LP64 compiler instead writes three
++     64-bit words (192 bits).  Both layouts advertise LTO version 2.1, so
++     that version alone cannot establish compatibility.
++
++     Serialize five 32-bit words on either host.  Binary significands are
++     aligned at the most-significant end of REAL_VALUE_TYPE.  On LP64, omit
++     the extra 32 least-significant bits only after checking they are zero.
++     BA2 binary formats need at most IEEE double precision; reject a value
++     that would lose significand bits instead of silently truncating it.  */
++#if HOST_BITS_PER_LONG == 32
++  for (i = 0; i < 5; i++)
++    bp_pack_value (bp, r.sig[i], 32);
++#elif HOST_BITS_PER_LONG == 64
++  /* The LP64 representation has 32 additional low guard bits.  Check
++     explicitly: gcc_assert can be compiled out in release builds.  */
++  if ((r.sig[0] & 0xffffffffUL) != 0)
++    fatal_error ("real constant does not fit the NXP LTO significand");
++  for (i = 0, bit = 32; i < 5; i++, bit += 32)
++    {
++      word = r.sig[bit / 64] >> (bit % 64);
++      bp_pack_value (bp, word & 0xffffffffUL, 32);
++    }
++#else
++# error unsupported HOST_BITS_PER_LONG for NXP-compatible BA2 LTO
++#endif
+ }
+ 
+ 
+@@ -141,8 +175,18 @@
+ {
+   struct fixed_value fv = TREE_FIXED_CST (expr);
+   bp_pack_enum (bp, machine_mode, MAX_MACHINE_MODE, fv.mode);
++#if HOST_BITS_PER_WIDE_INT == 32
+   bp_pack_var_len_int (bp, fv.data.low);
+   bp_pack_var_len_int (bp, fv.data.high);
++#elif HOST_BITS_PER_WIDE_INT == 64
++  if (fv.data.high != ((SIGNED_FIXED_POINT_MODE_P (fv.mode)
++                       && (fv.data.low >> 63)) ? -1 : 0))
++    fatal_error ("fixed-point constant does not fit the NXP LTO format");
++  bp_pack_var_len_int (bp, (int32_t) (fv.data.low & 0xffffffffU));
++  bp_pack_var_len_int (bp, (int32_t) (fv.data.low >> 32));
++#else
++# error unsupported HOST_BITS_PER_WIDE_INT for NXP-compatible BA2 LTO
++#endif
+ }
+ 
+ 
+@@ -924,9 +968,28 @@
+ void
+ streamer_write_integer_cst (struct output_block *ob, tree cst, bool ref_p)
+ {
++#if HOST_BITS_PER_WIDE_INT == 64
++  unsigned HOST_WIDE_INT low;
++#endif
++
+   streamer_write_record_start (ob, lto_tree_code_to_tag (INTEGER_CST));
+   stream_write_tree (ob, TREE_TYPE (cst), ref_p);
+   streamer_write_char_stream (ob->main_stream, TREE_OVERFLOW_P (cst));
++#if HOST_BITS_PER_WIDE_INT == 32
+   streamer_write_uhwi (ob, TREE_INT_CST_LOW (cst));
+   streamer_write_uhwi (ob, TREE_INT_CST_HIGH (cst));
++#elif HOST_BITS_PER_WIDE_INT == 64
++  /* Preserve the legacy two-32-bit-limb representation.  The native high
++     limb must match the type's sign or zero extension of the low limb;
++     otherwise the value cannot be represented without losing bits.  */
++  low = TREE_INT_CST_LOW (cst);
++  if (TREE_INT_CST_HIGH (cst)
++      != ((streamer_sign_extended_type_p (TREE_TYPE (cst))
++           && (low >> 63)) ? -1 : 0))
++    fatal_error ("integer constant does not fit the NXP LTO 64-bit format");
++  streamer_write_uhwi (ob, low & 0xffffffffU);
++  streamer_write_uhwi (ob, (low >> 32) & 0xffffffffU);
++#else
++# error unsupported HOST_BITS_PER_WIDE_INT for NXP-compatible BA2 LTO
++#endif
+ }
+--- gcc/lto-cgraph.c
++++ gcc/lto-cgraph.c
+@@ -534,8 +534,8 @@
+ 	 (ob->main_stream,
+ 	  1 + (node->thunk.this_adjusting != 0) * 2
+ 	  + (node->thunk.virtual_offset_p != 0) * 4);
+-      streamer_write_uhwi_stream (ob->main_stream, node->thunk.fixed_offset);
+-      streamer_write_uhwi_stream (ob->main_stream, node->thunk.virtual_value);
++      streamer_write_hwi32_stream (ob->main_stream, node->thunk.fixed_offset);
++      streamer_write_hwi32_stream (ob->main_stream, node->thunk.virtual_value);
+     }
+   if ((node->alias || node->thunk.thunk_p)
+       && (!boundary_p || (node->alias && DECL_EXTERNAL (node->decl))))
+@@ -1022,8 +1022,8 @@
+   if (node->thunk.thunk_p)
+     {
+       int type = streamer_read_uhwi (ib);
+-      HOST_WIDE_INT fixed_offset = streamer_read_uhwi (ib);
+-      HOST_WIDE_INT virtual_value = streamer_read_uhwi (ib);
++      HOST_WIDE_INT fixed_offset = streamer_read_hwi32 (ib);
++      HOST_WIDE_INT virtual_value = streamer_read_hwi32 (ib);
+ 
+       node->thunk.fixed_offset = fixed_offset;
+       node->thunk.this_adjusting = (type & 2);
+--- gcc/ipa-prop.c
++++ gcc/ipa-prop.c
+@@ -2774,7 +2774,8 @@
+     case IPA_JF_UNKNOWN:
+       break;
+     case IPA_JF_KNOWN_TYPE:
+-      streamer_write_uhwi (ob, jump_func->value.known_type.offset);
++      streamer_write_hwi32_stream (ob->main_stream,
++                                   jump_func->value.known_type.offset);
+       stream_write_tree (ob, jump_func->value.known_type.base_type, true);
+       stream_write_tree (ob, jump_func->value.known_type.component_type, true);
+       break;
+@@ -2787,7 +2788,8 @@
+       streamer_write_uhwi (ob, jump_func->value.pass_through.operation);
+       break;
+     case IPA_JF_ANCESTOR:
+-      streamer_write_uhwi (ob, jump_func->value.ancestor.offset);
++      streamer_write_hwi32_stream (ob->main_stream,
++                                   jump_func->value.ancestor.offset);
+       stream_write_tree (ob, jump_func->value.ancestor.type, true);
+       streamer_write_uhwi (ob, jump_func->value.ancestor.formal_id);
+       break;
+@@ -2812,7 +2814,7 @@
+     case IPA_JF_UNKNOWN:
+       break;
+     case IPA_JF_KNOWN_TYPE:
+-      jump_func->value.known_type.offset = streamer_read_uhwi (ib);
++      jump_func->value.known_type.offset = streamer_read_hwi32 (ib);
+       jump_func->value.known_type.base_type = stream_read_tree (ib, data_in);
+       jump_func->value.known_type.component_type = stream_read_tree (ib,
+ 								     data_in);
+@@ -2827,7 +2829,7 @@
+ 	= (enum tree_code) streamer_read_uhwi (ib);
+       break;
+     case IPA_JF_ANCESTOR:
+-      jump_func->value.ancestor.offset = streamer_read_uhwi (ib);
++      jump_func->value.ancestor.offset = streamer_read_hwi32 (ib);
+       jump_func->value.ancestor.type = stream_read_tree (ib, data_in);
+       jump_func->value.ancestor.formal_id = streamer_read_uhwi (ib);
+       break;
